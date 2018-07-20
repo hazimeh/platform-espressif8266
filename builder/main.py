@@ -16,15 +16,26 @@
 
 import re
 from os.path import join
-
+from platformio import util
 
 from SCons.Script import (ARGUMENTS, COMMAND_LINE_TARGETS, AlwaysBuild,
                           Builder, Default, DefaultEnvironment)
-from platformio import util
 
-#
-# Helpers
-#
+
+def _get_flash_size(env):
+    # use board's flash size by default
+    board_max_size = int(env.BoardConfig().get("upload.maximum_size", 0))
+
+    # check if user overrides LD Script
+    match = re.search(r"\.flash\.(\d+)(m|k).*\.ld", env.GetActualLDScript())
+    if match:
+        if match.group(2) == "k":
+            board_max_size = int(match.group(1)) * 1024
+        elif match.group(2) == "m":
+            board_max_size = int(match.group(1)) * 1024 * 1024
+
+    return ("%dK" % (board_max_size / 1024) if board_max_size < 1048576
+            else "%dM" % (board_max_size / 1048576))
 
 
 def _get_board_f_flash(env):
@@ -32,99 +43,15 @@ def _get_board_f_flash(env):
     frequency = str(frequency).replace("L", "")
     return int(int(frequency) / 1000000)
 
+def _is_ota(env):
+    return env.BoardConfig().get("build.ota", False)
 
-def _parse_size(value):
-    if isinstance(value, int):
-        return value
-    elif value.isdigit():
-        return int(value)
-    elif value.startswith("0x"):
-        return int(value, 16)
-    elif value[-1].upper() in ("K", "M"):
-        base = 1024 if value[-1].upper() == "K" else 1024 * 1024
-        return int(value[:-1]) * base
-    return value
-
-
-@util.memoized()
-def _parse_ld_sizes(ldscript_path):
-    assert ldscript_path
-    result = {}
-    # get flash size from board's manifest
-    result['flash_size'] = int(env.BoardConfig().get("upload.maximum_size", 0))
-    # get flash size from LD script path
-    match = re.search(r"\.flash\.(\d+[mk]).*\.ld", ldscript_path)
-    if match:
-        result['flash_size'] = _parse_size(match.group(1))
-
-    appsize_re = re.compile(
-        r"irom0_0_seg\s*:.+len\s*=\s*(0x[\da-f]+)", flags=re.I)
-    spiffs_re = re.compile(
-        r"PROVIDE\s*\(\s*_SPIFFS_(\w+)\s*=\s*(0x[\da-f]+)\s*\)", flags=re.I)
-    with open(ldscript_path) as fp:
-        for line in fp.readlines():
-            line = line.strip()
-            if not line or line.startswith("/*"):
-                continue
-            match = appsize_re.search(line)
-            if match:
-                result['app_size'] = _parse_size(match.group(1))
-                continue
-            match = spiffs_re.search(line)
-            if match:
-                result['spiffs_%s' % match.group(1)] = _parse_size(
-                    match.group(2))
-    return result
-
-
-def _get_flash_size(env):
-    ldsizes = _parse_ld_sizes(env.GetActualLDScript())
-    if ldsizes['flash_size'] < 1048576:
-        return "%dK" % (ldsizes['flash_size'] / 1024)
-    return "%dM" % (ldsizes['flash_size'] / 1048576)
-
-
-def fetch_spiffs_size(env):
-    ldsizes = _parse_ld_sizes(env.GetActualLDScript())
-    for key in ldsizes:
-        if key.startswith("spiffs_"):
-            env[key.upper()] = ldsizes[key]
-
-    assert all([
-        k in env
-        for k in ["SPIFFS_START", "SPIFFS_END", "SPIFFS_PAGE", "SPIFFS_BLOCK"]
-    ])
-
-    # esptool flash starts from 0
-    for k in ("SPIFFS_START", "SPIFFS_END"):
-        _value = 0
-        if env[k] < 0x40300000:
-            _value = env[k] & 0xFFFFF
-        elif env[k] < 0x411FB000:
-            _value = env[k] & 0xFFFFFF
-            _value -= 0x200000  # correction
-        else:
-            _value = env[k] & 0xFFFFFF
-            _value += 0xE00000  # correction
-
-        env[k] = _value
-
-
-def __fetch_spiffs_size(target, source, env):
-    fetch_spiffs_size(env)
-    return (target, source)
-
-
-def _update_max_upload_size(env):
-    ldsizes = _parse_ld_sizes(env.GetActualLDScript())
-    if ldsizes and "app_size" in ldsizes:
-        env.BoardConfig().update("upload.maximum_size", ldsizes['app_size'])
-
-
-########################################################
 
 env = DefaultEnvironment()
 platform = env.PioPlatform()
+config = util.load_project_config()
+if _is_ota(env):
+    app = config.get("env:" + env["PIOENV"], "app")
 
 env.Replace(
     __get_flash_size=_get_flash_size,
@@ -135,6 +62,7 @@ env.Replace(
     CC="xtensa-lx106-elf-gcc",
     CXX="xtensa-lx106-elf-g++",
     GDB="xtensa-lx106-elf-gdb",
+    NM="xtensa-lx106-elf-nm",
     OBJCOPY="esptool",
     RANLIB="xtensa-lx106-elf-ranlib",
     SIZETOOL="xtensa-lx106-elf-size",
@@ -192,6 +120,7 @@ env.Replace(
     FRAMEWORK_ARDUINOESP8266_DIR=platform.get_package_dir(
         "framework-arduinoespressif8266"),
     SDK_ESP8266_DIR=platform.get_package_dir("sdk-esp8266"),
+    NONOS_SDK_ESP8266_DIR=platform.get_package_dir("framework-esp8266-nonos-sdk"),
 
     #
     # Upload
@@ -221,11 +150,9 @@ env.Replace(
     #
 
     MKSPIFFSTOOL="mkspiffs",
-
-    SIZEPROGREGEXP=r"^(?:\.irom0\.text|\.text|\.data|\.rodata|)\s+([0-9]+).*",
-    SIZEDATAREGEXP=r"^(?:\.data|\.rodata|\.bss)\s+([0-9]+).*",
-    SIZECHECKCMD="$SIZETOOL -A -d $SOURCES",
     SIZEPRINTCMD='$SIZETOOL -B -d $SOURCES',
+    ESP8266_NONOS_SDK_GENAPP=join("$NONOS_SDK_ESP8266_DIR", "tools", "gen_appbin.py"),
+    ESP8266_NONOS_SDK_BOOTv17=join("$NONOS_SDK_ESP8266_DIR", "bin", "boot_v1.7.bin"),
 
     PROGSUFFIX=".elf"
 )
@@ -250,15 +177,53 @@ env.Replace(BUILD_FLAGS=[
     for f in env.get("BUILD_FLAGS", [])
 ])
 
+#
+# SPIFFS
+#
+
+
+def fetch_spiffs_size(env):
+    spiffs_re = re.compile(
+        r"PROVIDE\s*\(\s*_SPIFFS_(\w+)\s*=\s*(0x[\dA-F]+)\s*\)")
+    with open(env.GetActualLDScript()) as f:
+        for line in f.readlines():
+            match = spiffs_re.search(line)
+            if not match:
+                continue
+            env["SPIFFS_%s" % match.group(1).upper()] = match.group(2)
+
+    assert all([k in env for k in ["SPIFFS_START", "SPIFFS_END", "SPIFFS_PAGE",
+                                   "SPIFFS_BLOCK"]])
+
+    # esptool flash starts from 0
+    for k in ("SPIFFS_START", "SPIFFS_END"):
+        _value = 0
+        if int(env[k], 16) < 0x40300000:
+            _value = int(env[k], 16) & 0xFFFFF
+        elif int(env[k], 16) < 0x411FB000:
+            _value = int(env[k], 16) & 0xFFFFFF
+            _value -= 0x200000  # correction
+        else:
+            _value = int(env[k], 16) & 0xFFFFFF
+            _value += 0xE00000  # correction
+
+        env[k] = hex(_value)
+
+
+def __fetch_spiffs_size(target, source, env):
+    fetch_spiffs_size(env)
+    return (target, source)
+
+
 env.Append(
     BUILDERS=dict(
         DataToBin=Builder(
             action=env.VerboseAction(" ".join([
                 '"$MKSPIFFSTOOL"',
                 "-c", "$SOURCES",
-                "-p", "$SPIFFS_PAGE",
-                "-b", "$SPIFFS_BLOCK",
-                "-s", "${SPIFFS_END - SPIFFS_START}",
+                "-p", "${int(SPIFFS_PAGE, 16)}",
+                "-b", "${int(SPIFFS_BLOCK, 16)}",
+                "-s", "${int(SPIFFS_END, 16) - int(SPIFFS_START, 16)}",
                 "$TARGET"
             ]), "Building SPIFFS image from '$SOURCES' directory to $TARGET"),
             emitter=__fetch_spiffs_size,
@@ -270,7 +235,7 @@ env.Append(
 
 if "uploadfs" in COMMAND_LINE_TARGETS:
     env.Append(
-        UPLOADERFLAGS=["-ca", "${hex(SPIFFS_START)}"],
+        UPLOADERFLAGS=["-ca", "$SPIFFS_START"],
         UPLOADEROTAFLAGS=["-s"]
     )
 
@@ -332,9 +297,35 @@ else:
                 "-fno-builtin-printf",
             ]
         )
-        env.Replace(
-            UPLOAD_ADDRESS="0x10000",
-        )
+        if _is_ota(env):
+            env.Append(
+                BUILDERS=dict(
+                    GenSym=Builder(
+                        action=env.VerboseAction("$NM -g $SOURCE > $TARGET", "Generating symbols: $TARGET"),
+                        suffix=".sym"
+                    ),
+                    GenApp=Builder(
+                        action=env.VerboseAction(" ".join([
+                            "$ESP8266_NONOS_SDK_GENAPP",
+                            "$SOURCES",
+                            "$TARGET",
+                            "2",
+                            "2",
+                            "0",
+                            "2",
+                            app
+                        ]), "Generating OTA bin: $TARGET"),
+                        suffix=".bin"
+                    )
+                )
+            )
+            env.Replace(
+                UPLOAD_ADDRESS="0x1000",
+            )
+        else:
+            env.Replace(
+                UPLOAD_ADDRESS="0x10000",
+            )
 
     # Configure Native SDK
     else:
@@ -358,48 +349,83 @@ else:
         )
 
     # ESP8266 RTOS SDK and Native SDK common configuration
-    env.Append(
-        BUILDERS=dict(
-            ElfToBin=Builder(
-                action=env.VerboseAction(" ".join([
-                    '"$OBJCOPY"',
-                    "-eo", "$SOURCES",
-                    "-bo", "${TARGETS[0]}",
-                    "-bm", "$BOARD_FLASH_MODE",
-                    "-bf", "${__get_board_f_flash(__env__)}",
-                    "-bz", "${__get_flash_size(__env__)}",
-                    "-bs", ".text",
-                    "-bs", ".data",
-                    "-bs", ".rodata",
-                    "-bc", "-ec",
-                    "-eo", "$SOURCES",
-                    "-es", ".irom0.text", "${TARGETS[1]}",
-                    "-ec", "-v"
-                ]), "Building $TARGET"),
-                suffix=".bin"
+    if _is_ota(env):
+        env.Append(
+            BUILDERS=dict(
+                ElfToBin=Builder(
+                    action=env.VerboseAction(" ".join([
+                        '"$OBJCOPY"',
+                        "-eo", "$SOURCES",
+                        "-es", ".text", "${TARGETS[0]}",
+                        "-es", ".data", "${TARGETS[1]}",
+                        "-es", ".rodata", "${TARGETS[2]}",
+                        "-es", ".irom0.text", "${TARGETS[3]}",
+                        "-ec", "-v"
+                    ]), "Building $TARGET"),
+                    suffix=".bin"
+                )
             )
         )
-    )
-
-    env.Replace(
-        UPLOADERFLAGS=[
-            "-vv",
-            "-cd", "$UPLOAD_RESETMETHOD",
-            "-cb", "$UPLOAD_SPEED",
-            "-cp", '"$UPLOAD_PORT"',
-            "-ca", "0x00000",
-            "-cf", "${SOURCES[0]}",
-            "-ca", "$UPLOAD_ADDRESS",
-            "-cf", "${SOURCES[1]}"
-        ],
-        UPLOADCMD='$UPLOADER $UPLOADERFLAGS',
-    )
+        env.Replace(
+            UPLOADER=join(platform.get_package_dir("tool-esptoolpy"), "esptool.py"),
+            UPLOADERFLAGS=[
+                "--baud", "$UPLOAD_SPEED",
+                "--port", "$UPLOAD_PORT",
+                "--chip", "esp8266",
+                "--after", "no_reset"
+            ],
+            UPLOADERWRITEFLAGS=[
+                "--flash_freq", "${__get_board_f_flash(__env__)}m",
+                "--flash_mode", "$BOARD_FLASH_MODE",
+                "--flash_size", "${__get_flash_size(__env__)}B",
+                "0x00000", "$ESP8266_NONOS_SDK_BOOTv17",
+                "$UPLOAD_ADDRESS", "$SOURCE"
+            ],
+            UPLOADCMD='$UPLOADER $UPLOADERFLAGS write_flash $UPLOADERWRITEFLAGS',
+        )
+    else:
+        env.Append(
+            BUILDERS=dict(
+                ElfToBin=Builder(
+                    action=env.VerboseAction(" ".join([
+                        '"$OBJCOPY"',
+                        "-eo", "$SOURCES",
+                        "-bo", "${TARGETS[0]}",
+                        "-bm", "$BOARD_FLASH_MODE",
+                        "-bf", "${__get_board_f_flash(__env__)}",
+                        "-bz", "${__get_flash_size(__env__)}",
+                        "-bs", ".text",
+                        "-bs", ".data",
+                        "-bs", ".rodata",
+                        "-bc", "-ec",
+                        "-eo", "$SOURCES",
+                        "-es", ".irom0.text", "${TARGETS[1]}",
+                        "-ec", "-v"
+                    ]), "Building $TARGET"),
+                    suffix=".bin"
+                )
+            )
+        )
+        env.Replace(
+            UPLOADERFLAGS=[
+                "-vv",
+                "-cd", "$UPLOAD_RESETMETHOD",
+                "-cb", "$UPLOAD_SPEED",
+                "-cp", '"$UPLOAD_PORT"',
+                "-ca", "0x00000",
+                "-cf", "${SOURCES[0]}",
+                "-ca", "$UPLOAD_ADDRESS",
+                "-cf", "${SOURCES[1]}"
+            ],
+            UPLOADCMD='$UPLOADER $UPLOADERFLAGS',
+        )
 
 #
 # Target: Build executable and linkable firmware or SPIFFS image
 #
 
 target_elf = env.BuildProgram()
+print target_elf
 if "nobuild" in COMMAND_LINE_TARGETS:
     if set(["uploadfs", "uploadfsota"]) & set(COMMAND_LINE_TARGETS):
         fetch_spiffs_size(env)
@@ -422,24 +448,26 @@ else:
             target_firm = env.ElfToBin(
                 join("$BUILD_DIR", "${PROGNAME}"), target_elf)
         else:
-            target_firm = env.ElfToBin([
-                join("$BUILD_DIR", "eagle.flash.bin"),
-                join("$BUILD_DIR", "eagle.irom0text.bin")
-            ], target_elf)
+            if _is_ota(env):
+                target_segments = env.ElfToBin([
+                    join("$BUILD_DIR", "eagle.app.v6.text.bin"),
+                    join("$BUILD_DIR", "eagle.app.v6.data.bin"),
+                    join("$BUILD_DIR", "eagle.app.v6.rodata.bin"),
+                    join("$BUILD_DIR", "eagle.app.v6.irom0text.bin")
+                ], target_elf)
+                target_sym = env.GenSym(join("$BUILD_DIR", "eagle.app.sym"), target_elf)
+                #env.Depends(target_sym, target_segments)
+                target_firm = env.GenApp(join("$BUILD_DIR", "eagle.app.flash.bin"), [target_sym, target_elf, target_segments])
+                #env.Depends(target_firm, target_sym)
+                #target_firm = target_sym
+            else:
+                target_firm = env.ElfToBin([
+                    join("$BUILD_DIR", "eagle.flash.bin"),
+                    join("$BUILD_DIR", "eagle.irom0text.bin")
+                ], target_elf)
 
 AlwaysBuild(env.Alias("nobuild", target_firm))
 target_buildprog = env.Alias("buildprog", target_firm, target_firm)
-
-# update max upload size based on CSV file
-if env.get("PIOMAINPROG"):
-    env.AddPreAction(
-        "checkprogsize",
-        env.VerboseAction(
-            lambda source, target, env: _update_max_upload_size(env),
-            "Retrieving maximum program size $SOURCE"))
-# remove after PIO Core 3.6 release
-elif set(["checkprogsize", "upload"]) & set(COMMAND_LINE_TARGETS):
-    _update_max_upload_size(env)
 
 #
 # Target: Print binary size
@@ -454,11 +482,14 @@ AlwaysBuild(target_size)
 # Target: Upload firmware or SPIFFS image
 #
 
-target_upload = env.Alias(
-    ["upload", "uploadfs"], target_firm,
-    [env.VerboseAction(env.AutodetectUploadPort, "Looking for upload port..."),
-     env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")])
-env.AlwaysBuild(target_upload)
+if not _is_ota(env) or (_is_ota(env) and app == "1"):
+    target_upload = env.Alias(
+        ["upload", "uploadfs"], target_firm,
+        [env.VerboseAction(env.AutodetectUploadPort, "Looking for upload port..."),
+         env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")])
+    env.AlwaysBuild(target_upload)
+else:
+    target_upload = env.Alias(["upload", "uploadfs"], target_firm, env.VerboseAction("echo", "No need to upload user2.bin"))
 
 
 #
