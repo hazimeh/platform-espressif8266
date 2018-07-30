@@ -407,17 +407,21 @@ else:
             )
         )
         env.Replace(
+            UPLOADER=join(platform.get_package_dir("tool-esptoolpy"), "esptool.py"),
             UPLOADERFLAGS=[
-                "-vv",
-                "-cd", "$UPLOAD_RESETMETHOD",
-                "-cb", "$UPLOAD_SPEED",
-                "-cp", '"$UPLOAD_PORT"',
-                "-ca", "0x00000",
-                "-cf", "${SOURCES[0]}",
-                "-ca", "$UPLOAD_ADDRESS",
-                "-cf", "${SOURCES[1]}"
+                "--baud", "$UPLOAD_SPEED",
+                "--port", "$UPLOAD_PORT",
+                "--chip", "esp8266",
+                "--after", "no_reset"
             ],
-            UPLOADCMD='$UPLOADER $UPLOADERFLAGS',
+            UPLOADERWRITEFLAGS=[
+                "--flash_freq", "${__get_board_f_flash(__env__)}m",
+                "--flash_mode", "$BOARD_FLASH_MODE",
+                "--flash_size", "${__get_flash_size(__env__)}B",
+                "0x00000", "${SOURCES[0]}",
+                "$UPLOAD_ADDRESS", "${SOURCES[1]}"
+            ],
+            UPLOADCMD='$UPLOADER $UPLOADERFLAGS write_flash $UPLOADERWRITEFLAGS',
         )
 
 #
