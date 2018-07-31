@@ -58,7 +58,7 @@
     "framework-esp8266-nonos-sdk": {
       "type": "framework",
       "optional": true,
-      "version": ">=2.2.1"
+      "version": ">=2.2.2"
     },
     "framework-simba": {
       "type": "framework",
