@@ -63,7 +63,7 @@ env.Replace(
     CXX="xtensa-lx106-elf-g++",
     GDB="xtensa-lx106-elf-gdb",
     NM="xtensa-lx106-elf-nm",
-    OBJCOPY="esptool",
+    OBJCOPY="esptool.exe",
     RANLIB="xtensa-lx106-elf-ranlib",
     SIZETOOL="xtensa-lx106-elf-size",
 
